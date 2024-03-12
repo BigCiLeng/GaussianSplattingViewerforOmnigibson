@@ -1,14 +1,21 @@
 import numpy as np
 from plyfile import PlyData
 from dataclasses import dataclass
+import pypose as pp
+import torch
 
 @dataclass
 class GaussianData:
-    xyz: np.ndarray
-    rot: np.ndarray
-    scale: np.ndarray
-    opacity: np.ndarray
-    sh: np.ndarray
+    def __init__(self, xyz, rot, scale, opacity, sh):
+        self.xyz = xyz
+        self.rot = rot
+        self.scale = scale
+        self.opacity = opacity
+        self.sh = sh
+        self.R = torch.zeros((3,3))
+        self.T = np.zeros(3)
+        self.state = {"xyz": xyz, "rot": rot}
+        self.is_state_dirty = False
     def flat(self) -> np.ndarray:
         ret = np.concatenate([self.xyz, self.rot, self.scale, self.opacity, self.sh], axis=-1)
         return np.ascontiguousarray(ret)
@@ -20,7 +27,42 @@ class GaussianData:
     def sh_dim(self):
         return self.sh.shape[-1]
 
+    def transform_by_matrix(self, R, T):
+        R = R.cuda().float()
+        T = torch.from_numpy(T).cuda()
+        num_points = self.xyz.shape[0]
 
+        # position
+        rt = torch.zeros((4, 4)).cuda()
+        rt[:3,:3] = R
+        rt[3,3] = 1.0
+        rt[:, 1:3] *= -1
+        rt[1:3, :] *= -1
+        rt[:3,3] = T
+        rt = rt.squeeze(0).repeat(num_points, 1, 1)
+        
+        xyz = torch.from_numpy(self.xyz).cuda()
+        xyz = torch.concatenate([xyz, torch.ones((num_points, 1)).cuda()], dim=1)
+        rot = torch.from_numpy(self.rot).cuda()
+        rot = torch.concatenate([rot[:, 1:], rot[:, 0].unsqueeze(1)], dim=1)
+        ori_so3 = pp.SO3(rot)
+        ori_matrix = ori_so3.matrix()
+        ori_rt = torch.zeros(num_points, 4, 4).cuda()
+        ori_rt[:, :3, :3] = ori_matrix
+        ori_rt[:, :, 3] = xyz 
+
+
+        res_rt = torch.bmm(rt, ori_rt)
+        res_means = res_rt[:, :3, 3]
+        result = res_rt[:, :3, :3]
+
+        res_quats = pp.from_matrix(result, ltype=pp.SO3_type, check=False).tensor()
+        res_quats = torch.concatenate([res_quats[:,3].unsqueeze(1), res_quats[:, 0:3]], dim=1)
+        res_means = res_means.cpu().numpy()
+        res_quats = res_quats.cpu().numpy()
+        self.state["xyz"] = res_means
+        self.state["rot"] = res_quats
+        self.is_state_dirty = False
 def naive_gaussian():
     gau_xyz = np.array([
         0, 0, 0,

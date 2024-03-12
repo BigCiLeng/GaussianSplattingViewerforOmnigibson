@@ -12,7 +12,12 @@ import os
 import sys
 import argparse
 from renderer_ogl import OpenGLRenderer, GaussianRenderBase
-
+from pathlib import Path
+from socket import socket, AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_RCVBUF
+from struct import unpack
+import pypose as pp
+import torch
+import json
 
 # Add the directory containing main.py to the Python path
 dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -22,7 +27,7 @@ sys.path.append(dir_path)
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 
-g_camera = util.Camera(720, 1280)
+g_camera = util.Camera(1080, 1920)
 BACKEND_OGL=0
 BACKEND_CUDA=1
 g_renderer_list = [
@@ -31,9 +36,9 @@ g_renderer_list = [
 g_renderer_idx = BACKEND_OGL
 g_renderer: GaussianRenderBase = g_renderer_list[g_renderer_idx]
 g_scale_modifier = 1.
-g_auto_sort = False
+g_auto_sort = True
 g_show_control_win = True
-g_show_help_win = True
+g_show_help_win = False
 g_show_camera_win = False
 g_render_mode_tables = ["Gaussian Ball", "Flat Ball", "Billboard", "Depth", "SH:0", "SH:0~1", "SH:0~2", "SH:0~3 (default)"]
 g_render_mode = 7
@@ -132,6 +137,11 @@ def main():
     
     glfw.set_window_size_callback(window, window_resize_callback)
 
+    take_photo_flag = False
+    photo_idx = 0
+    last_R = torch.zeros((3,3))
+    last_T = np.zeros(3)
+
     # init renderer
     g_renderer_list[BACKEND_OGL] = OpenGLRenderer(g_camera.w, g_camera.h)
     try:
@@ -145,9 +155,23 @@ def main():
     g_renderer = g_renderer_list[g_renderer_idx]
 
     # gaussian data
-    gaussians = util_gau.naive_gaussian()
-    update_activated_renderer_state(gaussians)
+    # gaussians = util_gau.naive_gaussian()
+    # update_activated_renderer_state(gaussians)
+    gaussians_all = {}
+    data_all = list(args.data_path.glob("*.ply"))
+    for data_path in data_all:
+        data_path = Path(data_path)
+        gs = util_gau.load_ply(data_path)
+        gaussians_all[data_path.stem] = gs
+    update_activated_renderer_state(gaussians_all)
     
+    if args.use_socket:
+        s = socket(family=AF_INET, type=SOCK_DGRAM)
+        try:
+            s.bind(("127.0.0.1", 2000))
+        except:
+            s.close()
+            args.use_socket = False
     # settings
     while not glfw.window_should_close(window):
         glfw.poll_events()
@@ -181,9 +205,6 @@ def main():
             if imgui.begin("Control", True):
                 # rendering backend
                 changed, g_renderer_idx = imgui.combo("backend", g_renderer_idx, ["ogl", "cuda"][:len(g_renderer_list)])
-                if changed:
-                    g_renderer = g_renderer_list[g_renderer_idx]
-                    update_activated_renderer_state(gaussians)
 
                 imgui.text(f"fps = {imgui.get_io().framerate:.1f}")
 
@@ -191,19 +212,19 @@ def main():
                         "reduce updates", g_renderer.reduce_updates,
                     )
 
-                imgui.text(f"# of Gaus = {len(gaussians)}")
-                if imgui.button(label='open ply'):
-                    file_path = filedialog.askopenfilename(title="open ply",
-                        initialdir="C:\\Users\\MSI_NB\\Downloads\\viewers",
-                        filetypes=[('ply file', '.ply')]
-                        )
-                    if file_path:
-                        try:
-                            gaussians = util_gau.load_ply(file_path)
-                            g_renderer.update_gaussian_data(gaussians)
-                            g_renderer.sort_and_update(g_camera)
-                        except RuntimeError as e:
-                            pass
+                # imgui.text(f"# of Gaus = {len(gaussians)}")
+                # if imgui.button(label='open ply'):
+                #     file_path = filedialog.askopenfilename(title="open ply",
+                #         initialdir="C:\\Users\\MSI_NB\\Downloads\\viewers",
+                #         filetypes=[('ply file', '.ply')]
+                #         )
+                #     if file_path:
+                #         try:
+                #             gaussians = util_gau.load_ply(file_path)
+                #             g_renderer.update_gaussian_data(gaussians)
+                #             g_renderer.sort_and_update(g_camera)
+                #         except RuntimeError as e:
+                #             pass
                 
                 # camera fov
                 changed, g_camera.fovy = imgui.slider_float(
@@ -211,7 +232,42 @@ def main():
                 )
                 g_camera.is_intrin_dirty = changed
                 update_camera_intrin_lazy()
-                
+                # transform
+                if args.use_socket:
+                    try:
+                        msg = s.recv(1024)
+                        msg=msg.decode('utf-8')
+                        recvmsg=json.loads(msg)
+                    except:
+                        s.close()
+                        args.use_socket = False
+                    if msg:
+                        for name, value in recvmsg.items():
+                            print(name)
+                            x, y, z = value["pos"]
+                            ox, oy, oz, ow = value["ori"]
+                            q = pp.SO3([ox, oy, oz, ow])
+                            R = q.matrix()
+                            T = np.array([x, y, z])
+                            if name in gaussians_all.keys():
+                                if not ((gaussians_all[name].R == R).all() and (gaussians_all[name].T == T).all()):
+                                    gaussians_all[name].T = T
+                                    gaussians_all[name].R = R
+                                    gaussians_all[name].is_state_dirty = True
+                                    print(name)
+                                    print("T", gaussians_all[name].T)
+                                    print("R", gaussians_all[name].R)
+                                    take_photo_flag = True
+                            elif name == "camera":
+                                g_renderer.update_camera_pose_from_socket(g_camera, R, T)
+                                if not ((last_R== R).all() and (last_T== T).all()):
+                                    print("camera:")
+                                    print("T", T)
+                                    print("R", R)
+                                    take_photo_flag = True
+                                    last_R = R
+                                    last_T = T
+                g_renderer.update_gaussian_data(gaussians_all)
                 # scale modifier
                 changed, g_scale_modifier = imgui.slider_float(
                     "", g_scale_modifier, 0.1, 10, "scale modifier = %.3f"
@@ -249,18 +305,6 @@ def main():
                     bufferdata = gl.glReadPixels(0, 0, width, height, gl.GL_RGB, gl.GL_UNSIGNED_BYTE)
                     img = np.frombuffer(bufferdata, np.uint8, -1).reshape(height, width, 3)
                     imageio.imwrite("save.png", img[::-1])
-                    # save intermediate information
-                    # np.savez(
-                    #     "save.npz",
-                    #     gau_xyz=gaussians.xyz,
-                    #     gau_s=gaussians.scale,
-                    #     gau_rot=gaussians.rot,
-                    #     gau_c=gaussians.sh,
-                    #     gau_a=gaussians.opacity,
-                    #     viewmat=g_camera.get_view_matrix(),
-                    #     projmat=g_camera.get_project_matrix(),
-                    #     hfovxyfocal=g_camera.get_htanfovxy_focal()
-                    # )
                 imgui.end()
 
         if g_show_camera_win:
@@ -323,6 +367,10 @@ if __name__ == "__main__":
     global args
     parser = argparse.ArgumentParser(description="NeUVF editor with optional HiDPI support.")
     parser.add_argument("--hidpi", action="store_true", help="Enable HiDPI scaling for the interface.")
+    parser.add_argument("--data_path", type=Path, help="ply path", default="/media/sim_1/DATA1/wangn/dataset/real2sim2real/510_table0/gs")
+    parser.add_argument("--use_socket", action="store_true", help="whether use socket")
+    parser.add_argument("--photo_save_path", type=Path, default=Path("test"))
+
     args = parser.parse_args()
 
     main()

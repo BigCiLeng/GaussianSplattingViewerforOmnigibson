@@ -141,12 +141,39 @@ class CUDARenderer(GaussianRenderBase):
     def update_vsync(self):
         if wglSwapIntervalEXT is not None:
             wglSwapIntervalEXT(1 if self.reduce_updates else 0)
-        else:
-            print("VSync is not supported")
+        # else:
+        #     print("VSync is not supported")
 
     def update_gaussian_data(self, gaus: util_gau.GaussianData):
         self.need_rerender = True
-        self.gaussians = gaus_cuda_from_cpu(gaus)
+        # self.gaussians = gaus_cuda_from_cpu(gaus)
+        gau_xyz = []
+        gau_rot = []
+        gau_s = []
+        gau_a = []
+        gau_c = []
+        for gaus_item in gaus.values():
+            if gaus_item.is_state_dirty:
+                R, T = gaus_item.R, gaus_item.T
+                gaus_item.transform_by_matrix(R, T)
+            gau_xyz.append(gaus_item.state["xyz"])
+            gau_rot.append(gaus_item.state["rot"])
+            gau_s.append(gaus_item.scale)
+            gau_a.append(gaus_item.opacity)
+            gau_c.append(gaus_item.sh)
+        gau_xyz = np.concatenate(gau_xyz, axis=0)
+        gau_rot = np.concatenate(gau_rot, axis=0)
+        gau_s = np.concatenate(gau_s, axis=0)
+        gau_a = np.concatenate(gau_a, axis=0)
+        gau_c = np.concatenate(gau_c, axis=0)
+        gaus_all = util_gau.GaussianData(
+            gau_xyz,
+            gau_rot,
+            gau_s,
+            gau_a,
+            gau_c
+        )
+        self.gaussians = gaus_cuda_from_cpu(gaus_all)
         self.raster_settings["sh_degree"] = int(np.round(np.sqrt(self.gaussians.sh_dim))) - 1
 
     def sort_and_update(self, camera: util.Camera):
@@ -197,6 +224,41 @@ class CUDARenderer(GaussianRenderBase):
         self.need_rerender = True
         view_matrix = camera.get_view_matrix()
         view_matrix[[0, 2], :] = -view_matrix[[0, 2], :]
+        proj = camera.get_project_matrix() @ view_matrix
+        self.raster_settings["viewmatrix"] = torch.tensor(view_matrix.T).float().cuda()
+        self.raster_settings["campos"] = torch.tensor(camera.position).float().cuda()
+        self.raster_settings["projmatrix"] = torch.tensor(proj.T).float().cuda()
+    def update_camera_pose_from_socket(self, camera: util.Camera, R, t):
+
+        # camera.position = t.astype(np.float32)
+        # view_matrix = camera.get_view_matrix()
+        # view_matrix[[0, 2], :] = -view_matrix[[0, 2], :]
+        # proj = camera.get_project_matrix() @ view_matrix
+        # self.raster_settings["viewmatrix"] = torch.tensor(view_matrix.T).float().cuda()
+        # self.raster_settings["campos"] = torch.tensor(camera.position).float().cuda()
+        # self.raster_settings["projmatrix"] = torch.tensor(proj.T).float().cuda()
+        # t[1:3] *= -1
+        rt = np.zeros((4, 4))
+        R = R.numpy()
+        rt[:3,:3] = R
+        rt[:3,3] = t
+        rt[3,3] = 1.0
+        rt[0:3, 1:3] *= -1
+        # rt = rt[np.array([0, 2, 1, 3]), :]
+        # rt[2, :] *= -1
+        view_matrix = np.linalg.inv(rt)
+
+        transpose = np.array([[-1.0, 0.0, 0.0, 0.0],
+                              [0.0, -1.0, 0.0, 0.0],
+                              [0.0, 0.0, 1.0, 0.0],
+                              [0.0, 0.0, 0.0, 1.0]])
+        view_matrix = transpose @ view_matrix
+        # R_c = view_matrix[:3, :3]
+        # view_matrix[[0, 2]:, :3] *= -1
+        # R_c[[0, 2], :] = -R_c[[0, 1], :]
+        # view_matrix[[0, 2], :] = -view_matrix[[0, 1], :]
+        # view_matrix[:,[0]] = -view_matrix[:,[0]]
+        # view_matrix = np.linalg.inv(view_matrix)
         proj = camera.get_project_matrix() @ view_matrix
         self.raster_settings["viewmatrix"] = torch.tensor(view_matrix.T).float().cuda()
         self.raster_settings["campos"] = torch.tensor(camera.position).float().cuda()

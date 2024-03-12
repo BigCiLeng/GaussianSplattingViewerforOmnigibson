@@ -10,7 +10,8 @@ class Camera:
         self.zfar = 100
         self.h = h
         self.w = w
-        self.fovy = np.pi / 2
+        # self.fovy = np.pi / 2
+        self.fovy = 0.8955465
         self.position = np.array([0.0, 0.0, 3.0]).astype(np.float32)
         self.target = np.array([0.0, 0.0, 0.0]).astype(np.float32)
         self.up = np.array([0.0, -1.0, 0.0]).astype(np.float32)
